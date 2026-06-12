@@ -96,6 +96,65 @@ fn ffmpeg_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(PathBuf::from("ffmpeg"))
 }
 
+#[cfg(target_os = "windows")]
+fn get_window_rect(title: &str) -> Option<(i32, i32, i32, i32)> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic,
+        IsWindowVisible,
+    };
+
+    // Pass target title + out param via lparam.
+    struct Search<'a> {
+        wanted: &'a [u16],
+        hwnd: HWND,
+    }
+    let wanted: Vec<u16> = std::ffi::OsStr::new(title).encode_wide().collect();
+    let mut search = Search { wanted: &wanted, hwnd: std::ptr::null_mut() };
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let s = &mut *(lparam as *mut Search);
+        if s.hwnd != std::ptr::null_mut() { return 0; } // stop
+        if IsWindowVisible(hwnd) == 0 { return TRUE; }
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 { return TRUE; }
+        let mut buf: Vec<u16> = vec![0; (len + 1) as usize];
+        let got = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if got <= 0 { return TRUE; }
+        let title_slice = &buf[..got as usize];
+        if title_slice == s.wanted {
+            s.hwnd = hwnd;
+            return 0;
+        }
+        // Fallback: case-sensitive substring match on OsString round-trip
+        let _ = OsString::from_wide(title_slice);
+        TRUE
+    }
+
+    unsafe {
+        EnumWindows(Some(enum_proc), &mut search as *mut _ as LPARAM);
+        if search.hwnd.is_null() {
+            return None;
+        }
+        // Skip minimized windows — GetWindowRect returns off-screen coords.
+        if IsIconic(search.hwnd) != 0 {
+            return None;
+        }
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(search.hwnd, &mut rect) == 0 {
+            return None;
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        Some((rect.left, rect.top, w, h))
+    }
+}
+
 #[tauri::command]
 pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<String, String> {
     let mut state = RECORDER.lock().map_err(|e| e.to_string())?;
@@ -115,6 +174,11 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
         .args(["-f", "gdigrab"])
         .args(["-framerate", &opts.framerate.to_string()]);
 
+    // In window mode we capture the whole desktop and crop to the target window's
+    // screen rect. gdigrab's `title=...` mode only sees GDI surfaces — modern
+    // DirectX/DWM-rendered apps (Chrome, Electron, WebView2) come out blank/white.
+    // Capturing the composited desktop and cropping always yields the real pixels.
+    let mut crop_filter: Option<String> = None;
     match opts.capture_mode {
         CaptureMode::Screen => {
             cmd.args(["-i", "desktop"]);
@@ -125,9 +189,18 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .ok_or("Window mode requires a window title")?;
-            // gdigrab uses "title=<window title>"
-            let input = format!("title={}", title);
-            cmd.args(["-i", &input]);
+
+            #[cfg(target_os = "windows")]
+            {
+                if let Some((x, y, w, h)) = get_window_rect(title) {
+                    // Snap to even dims; libx264 with yuv420p needs even width/height.
+                    let w_even = (w & !1).max(2);
+                    let h_even = (h & !1).max(2);
+                    crop_filter = Some(format!("crop={}:{}:{}:{}", w_even, h_even, x.max(0), y.max(0)));
+                }
+            }
+            // Always capture desktop; crop happens via -vf if we found the window.
+            cmd.args(["-i", "desktop"]);
         }
     }
 
@@ -145,6 +218,12 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
         .args(["-preset", "ultrafast"])
         .args(["-pix_fmt", "yuv420p"])
         .args(["-crf", "23"]);
+
+    // Apply window-crop filter if we computed one. Must come after -i but before
+    // the encoder is fine; ffmpeg orders by stream regardless.
+    if let Some(filter) = &crop_filter {
+        cmd.args(["-vf", filter]);
+    }
 
     if opts.include_audio {
         cmd.args(["-c:a", "aac"]).args(["-b:a", "128k"]);

@@ -34,7 +34,7 @@ export default function MiniBar() {
           await getCurrentWebviewWindow().close();
         }
       } catch {}
-    }, 250);
+    }, 1000);
     return () => window.clearInterval(id);
   }, []);
 

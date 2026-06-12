@@ -86,7 +86,7 @@ export default function App() {
         const s = await invoke<RecordingStatus>("get_status");
         setStatus(s);
       } catch {}
-    }, 250);
+    }, 1000);
     return () => {
       if (tickRef.current) window.clearInterval(tickRef.current);
     };
@@ -197,22 +197,28 @@ export default function App() {
       const s = await invoke<RecordingStatus>("get_status");
       setStatus(s);
 
-      // Show floating mini bar with stop button + open it BEFORE hiding main.
-      await openMiniBar();
-
-      // Auto-hide / minimize main window so it stops blocking the recorded view.
-      if (autoHide) {
-        // Small delay so the ffmpeg process is already capturing and the user
-        // sees the minimize animation rather than a sudden cut.
-        window.setTimeout(async () => {
-          try {
-            await getCurrentWindow().minimize();
-          } catch {}
-        }, 400);
+      // Open the mini bar (best-effort — must not block window hiding if it fails).
+      try {
+        await openMiniBar();
+      } catch (err) {
+        console.error("openMiniBar failed", err);
       }
+
       showToast("开始录制 · Ctrl+Alt+S 字幕 · Ctrl+Alt+R 停止");
     } catch (e: any) {
       showToast(`启动失败: ${e}`);
+      return;
+    }
+
+    // Hide main window OUTSIDE the try/catch so any failure above doesn't skip it.
+    // Use hide() instead of minimize() — minimized windows still occupy a taskbar
+    // slot and can flash during capture; hide() removes them from screen entirely.
+    if (autoHide) {
+      try {
+        await getCurrentWindow().hide();
+      } catch (err) {
+        console.error("hide failed", err);
+      }
     }
   };
 
@@ -226,11 +232,11 @@ export default function App() {
       const miniWin = await WebviewWindow.getByLabel("minibar");
       if (miniWin) await miniWin.close();
 
-      // Restore main window.
+      // Restore main window (it was hidden via hide() during start).
       try {
         const w = getCurrentWindow();
-        await w.unminimize();
         await w.show();
+        await w.unminimize();
         await w.setFocus();
       } catch {}
 
