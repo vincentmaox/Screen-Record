@@ -45,17 +45,36 @@ pub struct RecordingStatus {
 
 fn ffmpeg_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
-    let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
-    let bundled = resource_dir.join("binaries").join("ffmpeg.exe");
-    if bundled.exists() {
-        return Ok(bundled);
+
+    // 1) Portable mode: ffmpeg.exe sitting next to our exe (U-stick friendly).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let portable = parent.join("ffmpeg.exe");
+            if portable.exists() {
+                return Ok(portable);
+            }
+            let portable_sub = parent.join("binaries").join("ffmpeg.exe");
+            if portable_sub.exists() {
+                return Ok(portable_sub);
+            }
+        }
     }
-    // Fallback: dev mode — look in src-tauri/binaries/
+
+    // 2) Installed mode: Tauri resource_dir/binaries/ffmpeg.exe
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let bundled = resource_dir.join("binaries").join("ffmpeg.exe");
+        if bundled.exists() {
+            return Ok(bundled);
+        }
+    }
+
+    // 3) Dev mode: src-tauri/binaries/ffmpeg.exe
     let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("binaries").join("ffmpeg.exe");
     if dev.exists() {
         return Ok(dev);
     }
-    // Last resort: rely on PATH
+
+    // 4) Last resort: rely on PATH
     Ok(PathBuf::from("ffmpeg"))
 }
 
