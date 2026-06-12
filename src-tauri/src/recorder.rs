@@ -37,7 +37,11 @@ pub struct RecordOptions {
     pub capture_mode: CaptureMode,
     #[serde(default)]
     pub window_title: Option<String>, // exact title for CaptureMode::Window
+    #[serde(default = "default_show_cursor")]
+    pub show_cursor: bool,
 }
+
+fn default_show_cursor() -> bool { true }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -172,7 +176,10 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
     let mut cmd = Command::new(&ffmpeg);
     cmd.arg("-y")
         .args(["-f", "gdigrab"])
-        .args(["-framerate", &opts.framerate.to_string()]);
+        .args(["-framerate", &opts.framerate.to_string()])
+        .args(["-draw_mouse", if opts.show_cursor { "1" } else { "0" }])
+        // Larger real-time buffer smooths out gdigrab timing jitter on busy CPUs.
+        .args(["-rtbufsize", "100M"]);
 
     // In window mode we capture the whole desktop and crop to the target window's
     // screen rect. gdigrab's `title=...` mode only sees GDI surfaces — modern

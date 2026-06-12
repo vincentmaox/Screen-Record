@@ -1,6 +1,6 @@
 [package]
 name = "screen-record"
-version = "0.2.2"
+version = "0.2.3"
 description = "Lightweight portable screen recorder with Apple-style UI"
 authors = ["vincentmaox"]
 edition = "2021"

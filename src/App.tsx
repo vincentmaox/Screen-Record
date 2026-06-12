@@ -48,6 +48,7 @@ export default function App() {
   const [outputDir, setOutputDir] = useState<string>("");
   const [framerate, setFramerate] = useState(30);
   const [includeAudio, setIncludeAudio] = useState(false);
+  const [showCursor, setShowCursor] = useState(true);
   const [captureMode, setCaptureMode] = useState<CaptureMode>("screen");
   const [windows, setWindows] = useState<WindowInfo[]>([]);
   const [selectedWindow, setSelectedWindow] = useState<string>("");
@@ -182,6 +183,8 @@ export default function App() {
       await openWindowPicker();
       return;
     }
+
+    // 1) Start ffmpeg recording — this is the only critical step.
     try {
       await invoke("start_recording", {
         opts: {
@@ -191,35 +194,45 @@ export default function App() {
           audio_device: null,
           capture_mode: captureMode,
           window_title: captureMode === "window" ? selectedWindow : null,
+          show_cursor: showCursor,
         },
       });
-      await registerHotkeys();
-      const s = await invoke<RecordingStatus>("get_status");
-      setStatus(s);
-
-      // Open the mini bar (best-effort — must not block window hiding if it fails).
-      try {
-        await openMiniBar();
-      } catch (err) {
-        console.error("openMiniBar failed", err);
-      }
-
-      showToast("开始录制 · Ctrl+Alt+S 字幕 · Ctrl+Alt+R 停止");
     } catch (e: any) {
       showToast(`启动失败: ${e}`);
       return;
     }
 
-    // Hide main window OUTSIDE the try/catch so any failure above doesn't skip it.
-    // Use hide() instead of minimize() — minimized windows still occupy a taskbar
-    // slot and can flash during capture; hide() removes them from screen entirely.
+    // 2) Immediately hide main window so it stops covering the captured area.
+    //    MUST happen before any optional step that could fail (registerHotkeys
+    //    often throws on company PCs with global-shortcut group policies).
     if (autoHide) {
       try {
         await getCurrentWindow().hide();
+        console.log("main window hidden");
       } catch (err) {
         console.error("hide failed", err);
       }
     }
+
+    // 3) Everything after this is best-effort — hotkeys, mini-bar, status poll.
+    try {
+      await registerHotkeys();
+    } catch (err) {
+      console.warn("registerHotkeys failed", err);
+    }
+
+    try {
+      await openMiniBar();
+    } catch (err) {
+      console.warn("openMiniBar failed", err);
+    }
+
+    try {
+      const s = await invoke<RecordingStatus>("get_status");
+      setStatus(s);
+    } catch {}
+
+    showToast("开始录制 · Ctrl+Alt+S 字幕 · Ctrl+Alt+R 停止");
   };
 
   const stop = async () => {
@@ -374,6 +387,20 @@ export default function App() {
             onClick={() => !status.is_recording && setIncludeAudio((v) => !v)}
             role="switch"
             aria-checked={includeAudio}
+          />
+        </div>
+        <div className="card-row">
+          <div className="card-row-label">
+            <span className="icon-bubble orange">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M7 2l-3 8h2l-4 12h16l-4-12h2l-3-8h-6zm1 2h4l1.5 4h-7l1.5-4zm-1.5 6h9l3.5 10h-16l3.5-10z"/></svg>
+            </span>
+            录制鼠标
+          </div>
+          <div
+            className={`switch ${showCursor ? "on" : ""}`}
+            onClick={() => !status.is_recording && setShowCursor((v) => !v)}
+            role="switch"
+            aria-checked={showCursor}
           />
         </div>
         <div className="card-row">
