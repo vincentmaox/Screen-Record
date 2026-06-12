@@ -2,7 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
+import { listen } from "@tauri-apps/api/event";
 
 interface RecordingStatus {
   is_recording: boolean;
@@ -11,7 +13,15 @@ interface RecordingStatus {
   subtitle_count: number;
 }
 
+interface WindowInfo {
+  title: string;
+  process_name: string;
+}
+
+type CaptureMode = "screen" | "window";
+
 const SUBTITLE_HOTKEY = "CommandOrControl+Alt+S";
+const STOP_HOTKEY = "CommandOrControl+Alt+R";
 
 function formatTime(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000));
@@ -38,8 +48,14 @@ export default function App() {
   const [outputDir, setOutputDir] = useState<string>("");
   const [framerate, setFramerate] = useState(30);
   const [includeAudio, setIncludeAudio] = useState(false);
+  const [captureMode, setCaptureMode] = useState<CaptureMode>("screen");
+  const [windows, setWindows] = useState<WindowInfo[]>([]);
+  const [selectedWindow, setSelectedWindow] = useState<string>("");
+  const [showWindowPicker, setShowWindowPicker] = useState(false);
+  const [autoHide, setAutoHide] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
   const tickRef = useRef<number | null>(null);
+  const stopRef = useRef<() => void>(() => {});
 
   const showToast = (msg: string) => {
     setToast(msg);
@@ -48,6 +64,16 @@ export default function App() {
 
   useEffect(() => {
     invoke<string>("default_output_dir").then(setOutputDir).catch(() => {});
+  }, []);
+
+  // Listen for stop request emitted by the mini bar.
+  useEffect(() => {
+    const unlistenPromise = listen("screenrec://stop", () => {
+      stopRef.current();
+    });
+    return () => {
+      unlistenPromise.then((un) => un());
+    };
   }, []);
 
   useEffect(() => {
@@ -65,6 +91,24 @@ export default function App() {
       if (tickRef.current) window.clearInterval(tickRef.current);
     };
   }, [status.is_recording]);
+
+  const refreshWindows = async () => {
+    try {
+      const list = await invoke<WindowInfo[]>("list_windows");
+      // Filter out our own windows.
+      const filtered = list.filter(
+        (w) => !w.title.includes("ScreenRecord") && w.process_name.toLowerCase() !== "screenrecord.exe"
+      );
+      setWindows(filtered);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const openWindowPicker = async () => {
+    await refreshWindows();
+    setShowWindowPicker(true);
+  };
 
   const openSubtitleWindow = async () => {
     const existing = await WebviewWindow.getByLabel("subtitle");
@@ -85,17 +129,43 @@ export default function App() {
       resizable: false,
       focus: true,
       center: false,
-      x: undefined,
-      y: undefined,
     });
     win.once("tauri://error", (e) => console.error("subtitle window error", e));
   };
 
-  const registerHotkey = async () => {
+  const openMiniBar = async () => {
+    const existing = await WebviewWindow.getByLabel("minibar");
+    if (existing) {
+      await existing.show();
+      await existing.setFocus();
+      return;
+    }
+    const win = new WebviewWindow("minibar", {
+      url: "index.html?window=minibar",
+      title: "Recording",
+      width: 240,
+      height: 56,
+      decorations: false,
+      transparent: true,
+      alwaysOnTop: true,
+      skipTaskbar: true,
+      resizable: false,
+      focus: false,
+      x: 24,
+      y: 24,
+    });
+    win.once("tauri://error", (e) => console.error("minibar error", e));
+  };
+
+  const registerHotkeys = async () => {
     try {
       await unregister(SUBTITLE_HOTKEY).catch(() => {});
+      await unregister(STOP_HOTKEY).catch(() => {});
       await register(SUBTITLE_HOTKEY, async (e) => {
         if (e.state === "Pressed") await openSubtitleWindow();
+      });
+      await register(STOP_HOTKEY, async (e) => {
+        if (e.state === "Pressed") await stop();
       });
     } catch (err) {
       console.warn("hotkey register failed", err);
@@ -107,6 +177,11 @@ export default function App() {
       showToast("请先选择保存位置");
       return;
     }
+    if (captureMode === "window" && !selectedWindow) {
+      showToast("请先选择要录制的窗口");
+      await openWindowPicker();
+      return;
+    }
     try {
       await invoke("start_recording", {
         opts: {
@@ -114,12 +189,28 @@ export default function App() {
           framerate,
           include_audio: includeAudio,
           audio_device: null,
+          capture_mode: captureMode,
+          window_title: captureMode === "window" ? selectedWindow : null,
         },
       });
-      await registerHotkey();
+      await registerHotkeys();
       const s = await invoke<RecordingStatus>("get_status");
       setStatus(s);
-      showToast("开始录制 · 按 Ctrl+Alt+S 插入字幕");
+
+      // Show floating mini bar with stop button + open it BEFORE hiding main.
+      await openMiniBar();
+
+      // Auto-hide / minimize main window so it stops blocking the recorded view.
+      if (autoHide) {
+        // Small delay so the ffmpeg process is already capturing and the user
+        // sees the minimize animation rather than a sudden cut.
+        window.setTimeout(async () => {
+          try {
+            await getCurrentWindow().minimize();
+          } catch {}
+        }, 400);
+      }
+      showToast("开始录制 · Ctrl+Alt+S 字幕 · Ctrl+Alt+R 停止");
     } catch (e: any) {
       showToast(`启动失败: ${e}`);
     }
@@ -129,14 +220,30 @@ export default function App() {
     try {
       const finalPath = await invoke<string>("stop_recording");
       await unregister(SUBTITLE_HOTKEY).catch(() => {});
-      const existing = await WebviewWindow.getByLabel("subtitle");
-      if (existing) await existing.close();
+      await unregister(STOP_HOTKEY).catch(() => {});
+      const subWin = await WebviewWindow.getByLabel("subtitle");
+      if (subWin) await subWin.close();
+      const miniWin = await WebviewWindow.getByLabel("minibar");
+      if (miniWin) await miniWin.close();
+
+      // Restore main window.
+      try {
+        const w = getCurrentWindow();
+        await w.unminimize();
+        await w.show();
+        await w.setFocus();
+      } catch {}
+
       setStatus({ is_recording: false, output_path: finalPath, elapsed_ms: 0, subtitle_count: 0 });
       showToast(`已保存 · ${shortenPath(finalPath, 40)}`);
     } catch (e: any) {
       showToast(`保存失败: ${e}`);
     }
   };
+
+  useEffect(() => {
+    stopRef.current = stop;
+  });
 
   const pickFolder = async () => {
     const selected = await openDialog({
@@ -149,6 +256,12 @@ export default function App() {
 
   const reveal = async () => {
     if (status.output_path) await invoke("reveal_in_explorer", { path: status.output_path });
+  };
+
+  const pickWindow = (title: string) => {
+    setSelectedWindow(title);
+    setCaptureMode("window");
+    setShowWindowPicker(false);
   };
 
   const timerText = useMemo(() => formatTime(status.elapsed_ms), [status.elapsed_ms]);
@@ -176,9 +289,7 @@ export default function App() {
       <div className="stage">
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
           <div className={`timer ${status.is_recording ? "recording" : ""}`}>{timerText}</div>
-          <div className="timer-label">
-            {status.is_recording ? "REC" : "READY"}
-          </div>
+          <div className="timer-label">{status.is_recording ? "REC" : "READY"}</div>
         </div>
         <button
           className={`record-btn ${status.is_recording ? "recording" : ""}`}
@@ -189,7 +300,44 @@ export default function App() {
         </button>
       </div>
 
+      {/* Mode segmented control */}
+      <div className="segmented">
+        <button
+          className={`seg-btn ${captureMode === "screen" ? "active" : ""}`}
+          onClick={() => !status.is_recording && setCaptureMode("screen")}
+          disabled={status.is_recording}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M3 4h18v12H3z" opacity=".25" /><path d="M3 4h18a1 1 0 011 1v11a1 1 0 01-1 1H3a1 1 0 01-1-1V5a1 1 0 011-1zm0 2v10h18V6H3zm5 14h8v2H8z" />
+          </svg>
+          全屏
+        </button>
+        <button
+          className={`seg-btn ${captureMode === "window" ? "active" : ""}`}
+          onClick={() => !status.is_recording && (selectedWindow ? setCaptureMode("window") : openWindowPicker())}
+          disabled={status.is_recording}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M4 5h16v3H4z" /><path d="M4 5h16v14H4z" opacity=".25" /><path d="M4 5h16a1 1 0 011 1v13a1 1 0 01-1 1H4a1 1 0 01-1-1V6a1 1 0 011-1zm0 2v12h16V7H4z" />
+          </svg>
+          窗口
+        </button>
+      </div>
+
       <div className="card">
+        {captureMode === "window" && (
+          <div className="card-row">
+            <div className="card-row-label">
+              <span className="icon-bubble blue">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M4 5h16v14H4z"/></svg>
+              </span>
+              选择窗口
+            </div>
+            <span className="path-pill" onClick={openWindowPicker} title={selectedWindow}>
+              {selectedWindow ? shortenPath(selectedWindow, 28) : "点击选择…"}
+            </span>
+          </div>
+        )}
         <div className="card-row">
           <div className="card-row-label">
             <span className="icon-bubble blue">
@@ -224,6 +372,20 @@ export default function App() {
         </div>
         <div className="card-row">
           <div className="card-row-label">
+            <span className="icon-bubble green">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M19 13H5v-2h14v2zm0-4H5V7h14v2z"/></svg>
+            </span>
+            开始时隐藏窗口
+          </div>
+          <div
+            className={`switch ${autoHide ? "on" : ""}`}
+            onClick={() => !status.is_recording && setAutoHide((v) => !v)}
+            role="switch"
+            aria-checked={autoHide}
+          />
+        </div>
+        <div className="card-row">
+          <div className="card-row-label">
             <span className="icon-bubble purple">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M10 4H4a2 2 0 00-2 2v12a2 2 0 002 2h16a2 2 0 002-2V8a2 2 0 00-2-2h-8l-2-2z"/></svg>
             </span>
@@ -249,8 +411,47 @@ export default function App() {
       </div>
 
       <div className="hint">
-        录制中按 <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>S</kbd> 弹出字幕输入框
+        <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>S</kbd> 字幕 ·{" "}
+        <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>R</kbd> 停止录制
       </div>
+
+      {/* Window picker modal */}
+      {showWindowPicker && (
+        <div className="modal-backdrop" onClick={() => setShowWindowPicker(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <span>选择窗口</span>
+              <button className="icon-btn" onClick={refreshWindows} title="刷新">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M17.65 6.35A7.95 7.95 0 0012 4a8 8 0 108 8h-2a6 6 0 11-1.76-4.24L13 11h7V4l-2.35 2.35z" />
+                </svg>
+              </button>
+            </div>
+            <div className="window-list">
+              {windows.length === 0 ? (
+                <div className="window-empty">未发现可录制窗口，点击右上角刷新</div>
+              ) : (
+                windows.map((w) => (
+                  <button
+                    key={w.title}
+                    className={`window-item ${selectedWindow === w.title ? "active" : ""}`}
+                    onClick={() => pickWindow(w.title)}
+                    title={w.title}
+                  >
+                    <div className="window-item-title">{w.title}</div>
+                    <div className="window-item-proc">{w.process_name}</div>
+                  </button>
+                ))
+              )}
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-ghost-light" onClick={() => setShowWindowPicker(false)}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {toast && <div className="toast">{toast}</div>}
     </div>

@@ -33,6 +33,24 @@ pub struct RecordOptions {
     pub framerate: u32,
     pub include_audio: bool,
     pub audio_device: Option<String>, // dshow device name; None = system default mic
+    #[serde(default)]
+    pub capture_mode: CaptureMode,
+    #[serde(default)]
+    pub window_title: Option<String>, // exact title for CaptureMode::Window
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureMode {
+    #[default]
+    Screen,
+    Window,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WindowInfo {
+    pub title: String,
+    pub process_name: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -95,8 +113,23 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
     let mut cmd = Command::new(&ffmpeg);
     cmd.arg("-y")
         .args(["-f", "gdigrab"])
-        .args(["-framerate", &opts.framerate.to_string()])
-        .args(["-i", "desktop"]);
+        .args(["-framerate", &opts.framerate.to_string()]);
+
+    match opts.capture_mode {
+        CaptureMode::Screen => {
+            cmd.args(["-i", "desktop"]);
+        }
+        CaptureMode::Window => {
+            let title = opts
+                .window_title
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or("Window mode requires a window title")?;
+            // gdigrab uses "title=<window title>"
+            let input = format!("title={}", title);
+            cmd.args(["-i", &input]);
+        }
+    }
 
     if opts.include_audio {
         // Use dshow with default audio device, or named device if specified.
@@ -297,4 +330,94 @@ pub fn reveal_in_explorer(path: String) -> Result<(), String> {
         cmd.spawn().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE, CloseHandle};
+    use windows_sys::Win32::System::ProcessStatus::GetModuleBaseNameW;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    };
+
+    struct Collected(Vec<WindowInfo>);
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let collected = &mut *(lparam as *mut Collected);
+
+        if IsWindowVisible(hwnd) == 0 {
+            return TRUE;
+        }
+        // Skip tool windows (tray, hidden chrome, etc.)
+        let exstyle = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        if exstyle & WS_EX_TOOLWINDOW != 0 {
+            return TRUE;
+        }
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return TRUE;
+        }
+        let mut buf: Vec<u16> = vec![0; (len + 1) as usize];
+        let got = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if got <= 0 {
+            return TRUE;
+        }
+        let title = OsString::from_wide(&buf[..got as usize])
+            .to_string_lossy()
+            .to_string();
+        if title.trim().is_empty() {
+            return TRUE;
+        }
+
+        // Resolve process name (best-effort).
+        let mut pid: u32 = 0;
+        let _ = GetWindowThreadProcessId(hwnd, &mut pid);
+        let mut process_name = String::new();
+        if pid != 0 {
+            let handle = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                0,
+                pid,
+            );
+            if !handle.is_null() {
+                let mut pbuf: [u16; 260] = [0; 260];
+                let got = GetModuleBaseNameW(handle, std::ptr::null_mut(), pbuf.as_mut_ptr(), pbuf.len() as u32);
+                if got > 0 {
+                    process_name = OsString::from_wide(&pbuf[..got as usize])
+                        .to_string_lossy()
+                        .to_string();
+                }
+                CloseHandle(handle);
+            }
+        }
+
+        collected.0.push(WindowInfo {
+            title,
+            process_name,
+        });
+        TRUE
+    }
+
+    let mut collected = Collected(Vec::new());
+    unsafe {
+        EnumWindows(Some(enum_proc), &mut collected as *mut _ as LPARAM);
+    }
+
+    // Deduplicate by title (gdigrab matches first window with that title anyway).
+    collected.0.sort_by(|a, b| a.title.cmp(&b.title));
+    collected.0.dedup_by(|a, b| a.title == b.title);
+    Ok(collected.0)
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
+    Ok(Vec::new())
 }

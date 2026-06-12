@@ -21,6 +21,7 @@ pub fn run() {
             recorder::get_status,
             recorder::default_output_dir,
             recorder::reveal_in_explorer,
+            recorder::list_windows,
         ])
         .setup(|app| {
             // Ensure binaries dir exists for dev mode hint.
