@@ -529,6 +529,301 @@
 
 .btn-ghost-light:hover { background: rgba(0,0,0,0.06); }
 
+/* === Floating-bar main window (v0.3.0) === */
+/* Body fills the bar shape (320×56) — bar uses inset:0 to occupy the whole window. */
+body:has(.float-bar),
+body:has(.float-pill) {
+  background: #1f1f22;
+}
+
+.float-bar {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: #1f1f22;
+  border-radius: 16px;
+  border: 0.5px solid rgba(255, 255, 255, 0.1);
+  user-select: none;
+}
+
+.float-bar.recording {
+  border-color: rgba(255, 59, 48, 0.4);
+  box-shadow: 0 0 0 1px rgba(255, 59, 48, 0.15);
+}
+
+.fb-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255, 255, 255, 0.75);
+  transition: background 0.12s, color 0.12s;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.fb-btn-ghost:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
+.fb-btn-ghost:disabled { opacity: 0.35; cursor: not-allowed; }
+.fb-btn-ghost:disabled:hover { background: transparent; color: rgba(255,255,255,0.75); }
+
+.fb-btn-close { color: rgba(255, 255, 255, 0.55); }
+.fb-btn-close:hover { background: rgba(255, 59, 48, 0.4); color: #fff; }
+
+.fb-record {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #ff453a 0%, #ff3b30 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(255, 59, 48, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  transition: transform 0.16s cubic-bezier(0.34, 1.56, 0.64, 1);
+  flex-shrink: 0;
+}
+
+.fb-record:hover { transform: scale(1.06); }
+.fb-record:active { transform: scale(0.94); }
+
+.fb-record-inner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: all 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.fb-record.recording .fb-record-inner {
+  border-radius: 3px;
+  width: 11px;
+  height: 11px;
+}
+
+.fb-timer {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 0 6px 0 4px;
+  flex: 1;
+  min-width: 0;
+  cursor: grab;
+}
+
+.fb-timer:active { cursor: grabbing; }
+
+.fb-timer-text {
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.92);
+  letter-spacing: -0.01em;
+  line-height: 1.1;
+}
+
+.fb-timer-text.rec { color: #ff6961; }
+
+.fb-timer-label {
+  font-size: 9px;
+  color: rgba(255, 255, 255, 0.5);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  margin-top: 1px;
+}
+
+.fb-badge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fb-toast {
+  position: fixed;
+  top: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(28, 28, 30, 0.96);
+  color: #fff;
+  padding: 8px 16px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  box-shadow: var(--shadow-lg);
+  white-space: nowrap;
+  pointer-events: none;
+  animation: toastIn 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+  z-index: 999;
+}
+
+/* === Recording pill (collapsed bar) === */
+.float-pill {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: rgba(28, 28, 30, 0.85);
+  border-radius: 16px;
+  border: 0.5px solid rgba(255, 59, 48, 0.5);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+
+.float-pill:hover { background: rgba(28, 28, 30, 0.95); }
+
+.fp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--record-red, #ff3b30);
+  animation: pulse 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.fp-time {
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  letter-spacing: -0.01em;
+}
+
+/* === Settings window (v0.3.0) === */
+.settings-window {
+  height: 100vh;
+  width: 100vw;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  padding: 16px 20px 20px;
+  gap: 14px;
+  overflow-y: auto;
+}
+
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 4px;
+}
+
+.settings-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.settings-loading {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+/* === Panel window (Settings / Window picker / Subtitle pane in single-window mode) === */
+.panel-window {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary, #fafafa);
+  padding: 14px 18px 16px;
+  gap: 12px;
+  overflow: hidden;
+  border-radius: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .panel-window { background: #1c1c1e; }
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 2px;
+  cursor: grab;
+}
+.panel-header:active { cursor: grabbing; }
+
+.panel-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+  flex: 1;
+}
+
+.panel-time {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 4px;
+}
+
+.subtitle-pane {
+  gap: 14px;
+}
+
+.subtitle-input-large {
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.08));
+  border-radius: 10px;
+  padding: 14px 16px;
+  font-size: 16px;
+  color: var(--text-primary);
+  width: 100%;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.subtitle-input-large:focus {
+  border-color: var(--accent, #0a84ff);
+  background: var(--bg-card-solid, #fff);
+  outline: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  .subtitle-input-large {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgba(255, 255, 255, 0.1);
+    color: #fff;
+  }
+  .subtitle-input-large:focus {
+    background: rgba(255, 255, 255, 0.1);
+  }
+}
+
 /* === Mini bar (recording overlay) === */
 .minibar {
   position: fixed;

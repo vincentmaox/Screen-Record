@@ -37,3 +37,6 @@ Recordings/
 # OS
 Thumbs.db
 release/
+
+# Reference dumps (scraped HTML/JS for WV2 research, not source code)
+build-tools/

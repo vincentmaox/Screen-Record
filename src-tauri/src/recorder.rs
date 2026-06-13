@@ -10,6 +10,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(target_os = "windows")]
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
 
 static RECORDER: Lazy<Mutex<RecorderState>> = Lazy::new(|| Mutex::new(RecorderState::default()));
 
@@ -173,64 +175,63 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
 
     let ffmpeg = ffmpeg_path(&app)?;
 
-    let mut cmd = Command::new(&ffmpeg);
-    cmd.arg("-y")
-        .args(["-f", "gdigrab"])
-        .args(["-framerate", &opts.framerate.to_string()])
-        .args(["-draw_mouse", if opts.show_cursor { "1" } else { "0" }])
-        // Larger real-time buffer smooths out gdigrab timing jitter on busy CPUs.
-        .args(["-rtbufsize", "100M"]);
+    // ddagrab (DXGI Desktop Duplication API) is GPU-path — same mechanism OBS
+    // uses. Eliminates the cursor stutter that gdigrab's CPU BitBlt causes on
+    // busy systems. Requires a BtbN GPL-licensed ffmpeg build.
 
-    // In window mode we capture the whole desktop and crop to the target window's
-    // screen rect. gdigrab's `title=...` mode only sees GDI surfaces — modern
-    // DirectX/DWM-rendered apps (Chrome, Electron, WebView2) come out blank/white.
-    // Capturing the composited desktop and cropping always yields the real pixels.
+    // Compute crop for window mode (applied in the filter chain below).
     let mut crop_filter: Option<String> = None;
-    match opts.capture_mode {
-        CaptureMode::Screen => {
-            cmd.args(["-i", "desktop"]);
-        }
-        CaptureMode::Window => {
-            let title = opts
-                .window_title
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .ok_or("Window mode requires a window title")?;
-
-            #[cfg(target_os = "windows")]
-            {
-                if let Some((x, y, w, h)) = get_window_rect(title) {
-                    // Snap to even dims; libx264 with yuv420p needs even width/height.
-                    let w_even = (w & !1).max(2);
-                    let h_even = (h & !1).max(2);
-                    crop_filter = Some(format!("crop={}:{}:{}:{}", w_even, h_even, x.max(0), y.max(0)));
-                }
+    if let CaptureMode::Window = opts.capture_mode {
+        let title = opts
+            .window_title
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or("Window mode requires a window title")?;
+        #[cfg(target_os = "windows")]
+        {
+            if let Some((x, y, w, h)) = get_window_rect(title) {
+                let w_even = (w & !1).max(2);
+                let h_even = (h & !1).max(2);
+                crop_filter = Some(format!("crop={}:{}:{}:{}", w_even, h_even, x.max(0), y.max(0)));
             }
-            // Always capture desktop; crop happens via -vf if we found the window.
-            cmd.args(["-i", "desktop"]);
         }
     }
 
+    // libx264 needs a CPU frame in yuv420p; ddagrab outputs GPU BGRA, so we
+    // must hwdownload + format-convert before the encoder. Optional crop is
+    // applied in CPU space (after hwdownload) for simplicity.
+    let filter_chain = {
+        let mut chain = format!(
+            "ddagrab=output_idx=0:framerate={}:draw_mouse={}",
+            opts.framerate,
+            if opts.show_cursor { 1 } else { 0 }
+        );
+        chain.push_str(",hwdownload,format=bgra");
+        if let Some(crop) = &crop_filter {
+            chain.push(',');
+            chain.push_str(crop);
+        }
+        chain
+    };
+
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.arg("-y")
+        .args(["-filter_complex", &filter_chain]);
+
     if opts.include_audio {
-        // Use dshow with default audio device, or named device if specified.
         let audio_arg = match &opts.audio_device {
             Some(name) if !name.is_empty() => format!("audio={name}"),
             _ => "audio=virtual-audio-capturer".to_string(),
         };
-        // Try the user-given device; if it fails, ffmpeg will error and we surface that.
         cmd.args(["-f", "dshow"]).args(["-i", &audio_arg]);
     }
 
     cmd.args(["-c:v", "libx264"])
-        .args(["-preset", "ultrafast"])
+        .args(["-preset", "superfast"])
+        .args(["-tune", "zerolatency"])
         .args(["-pix_fmt", "yuv420p"])
-        .args(["-crf", "23"]);
-
-    // Apply window-crop filter if we computed one. Must come after -i but before
-    // the encoder is fine; ffmpeg orders by stream regardless.
-    if let Some(filter) = &crop_filter {
-        cmd.args(["-vf", filter]);
-    }
+        .args(["-crf", "23"])
+        .args(["-threads", "2"]);
 
     if opts.include_audio {
         cmd.args(["-c:a", "aac"]).args(["-b:a", "128k"]);
@@ -243,7 +244,7 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
         .stderr(Stdio::null());
 
     #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
     let child = cmd.spawn().map_err(|e| format!("Failed to launch ffmpeg: {e}"))?;
 

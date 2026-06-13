@@ -1,10 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize, PhysicalPosition, currentMonitor } from "@tauri-apps/api/window";
 import { register, unregister } from "@tauri-apps/plugin-global-shortcut";
-import { listen } from "@tauri-apps/api/event";
 
 interface RecordingStatus {
   is_recording: boolean;
@@ -19,9 +17,20 @@ interface WindowInfo {
 }
 
 type CaptureMode = "screen" | "window";
+type Pane = "bar" | "settings" | "subtitle" | "windowPicker";
 
 const SUBTITLE_HOTKEY = "CommandOrControl+Alt+S";
 const STOP_HOTKEY = "CommandOrControl+Alt+R";
+const SETTINGS_KEY = "screenrec.settings.v1";
+
+const BAR_W = 320;
+const BAR_H = 56;
+const PILL_W = 96;
+const PILL_H = 32;
+const PANEL_W = 460;
+const PANEL_H = 600;
+const SUB_W = 560;
+const SUB_H = 200;
 
 function formatTime(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000));
@@ -38,45 +47,90 @@ function shortenPath(p: string, max = 36): string {
   return `…${tail}`;
 }
 
+interface Persisted {
+  outputDir: string;
+  framerate: number;
+  includeAudio: boolean;
+  showCursor: boolean;
+  captureMode: CaptureMode;
+  selectedWindow: string;
+}
+
+function loadSettings(): Partial<Persisted> {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw);
+  } catch { return {}; }
+}
+
+function saveSettings(s: Persisted) {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
+}
+
 export default function App() {
+  const persisted = loadSettings();
   const [status, setStatus] = useState<RecordingStatus>({
     is_recording: false,
     output_path: null,
     elapsed_ms: 0,
     subtitle_count: 0,
   });
-  const [outputDir, setOutputDir] = useState<string>("");
-  const [framerate, setFramerate] = useState(30);
-  const [includeAudio, setIncludeAudio] = useState(false);
-  const [showCursor, setShowCursor] = useState(true);
-  const [captureMode, setCaptureMode] = useState<CaptureMode>("screen");
+  const [outputDir, setOutputDir] = useState<string>(persisted.outputDir ?? "");
+  const [framerate, setFramerate] = useState(persisted.framerate ?? 30);
+  const [includeAudio, setIncludeAudio] = useState(persisted.includeAudio ?? false);
+  const [showCursor, setShowCursor] = useState(persisted.showCursor !== false);
+  const [captureMode, setCaptureMode] = useState<CaptureMode>(persisted.captureMode ?? "screen");
+  const [selectedWindow, setSelectedWindow] = useState<string>(persisted.selectedWindow ?? "");
+  const [pane, setPane] = useState<Pane>("bar");
   const [windows, setWindows] = useState<WindowInfo[]>([]);
-  const [selectedWindow, setSelectedWindow] = useState<string>("");
-  const [showWindowPicker, setShowWindowPicker] = useState(false);
-  const [autoHide, setAutoHide] = useState(true);
+  const [subtitleText, setSubtitleText] = useState("");
   const [toast, setToast] = useState<string | null>(null);
+  const [pillExpanded, setPillExpanded] = useState(false);
   const tickRef = useRef<number | null>(null);
   const stopRef = useRef<() => void>(() => {});
+  const subtitleInputRef = useRef<HTMLInputElement | null>(null);
+  const savedPosRef = useRef<{ x: number; y: number } | null>(null);
 
   const showToast = (msg: string) => {
     setToast(msg);
     window.setTimeout(() => setToast(null), 2200);
   };
 
+  // Resize the window to fit current pane.
+  // While recording in bar pane, shrink to a small pill unless hovered.
   useEffect(() => {
-    invoke<string>("default_output_dir").then(setOutputDir).catch(() => {});
+    const w = getCurrentWindow();
+    let target: { width: number; height: number };
+    switch (pane) {
+      case "settings":
+      case "windowPicker":
+        target = { width: PANEL_W, height: PANEL_H }; break;
+      case "subtitle":
+        target = { width: SUB_W, height: SUB_H }; break;
+      default:
+        if (status.is_recording && !pillExpanded) {
+          target = { width: PILL_W, height: PILL_H };
+        } else {
+          target = { width: BAR_W, height: BAR_H };
+        }
+    }
+    w.setSize(new LogicalSize(target.width, target.height)).catch((e) => console.error("setSize failed", e));
+  }, [pane, status.is_recording, pillExpanded]);
+
+  // Default output dir on first run.
+  useEffect(() => {
+    if (!outputDir) {
+      invoke<string>("default_output_dir").then(setOutputDir).catch(() => {});
+    }
   }, []);
 
-  // Listen for stop request emitted by the mini bar.
+  // Persist on change.
   useEffect(() => {
-    const unlistenPromise = listen("screenrec://stop", () => {
-      stopRef.current();
-    });
-    return () => {
-      unlistenPromise.then((un) => un());
-    };
-  }, []);
+    saveSettings({ outputDir, framerate, includeAudio, showCursor, captureMode, selectedWindow });
+  }, [outputDir, framerate, includeAudio, showCursor, captureMode, selectedWindow]);
 
+  // Status polling.
   useEffect(() => {
     if (!status.is_recording) {
       if (tickRef.current) window.clearInterval(tickRef.current);
@@ -88,15 +142,19 @@ export default function App() {
         setStatus(s);
       } catch {}
     }, 1000);
-    return () => {
-      if (tickRef.current) window.clearInterval(tickRef.current);
-    };
+    return () => { if (tickRef.current) window.clearInterval(tickRef.current); };
   }, [status.is_recording]);
+
+  // Auto-focus subtitle input when shown.
+  useEffect(() => {
+    if (pane === "subtitle") {
+      setTimeout(() => subtitleInputRef.current?.focus(), 50);
+    }
+  }, [pane]);
 
   const refreshWindows = async () => {
     try {
       const list = await invoke<WindowInfo[]>("list_windows");
-      // Filter out our own windows.
       const filtered = list.filter(
         (w) => !w.title.includes("ScreenRecord") && w.process_name.toLowerCase() !== "screenrecord.exe"
       );
@@ -108,54 +166,7 @@ export default function App() {
 
   const openWindowPicker = async () => {
     await refreshWindows();
-    setShowWindowPicker(true);
-  };
-
-  const openSubtitleWindow = async () => {
-    const existing = await WebviewWindow.getByLabel("subtitle");
-    if (existing) {
-      await existing.show();
-      await existing.setFocus();
-      return;
-    }
-    const win = new WebviewWindow("subtitle", {
-      url: "index.html?window=subtitle",
-      title: "Subtitle",
-      width: 560,
-      height: 180,
-      decorations: false,
-      transparent: true,
-      alwaysOnTop: true,
-      skipTaskbar: true,
-      resizable: false,
-      focus: true,
-      center: false,
-    });
-    win.once("tauri://error", (e) => console.error("subtitle window error", e));
-  };
-
-  const openMiniBar = async () => {
-    const existing = await WebviewWindow.getByLabel("minibar");
-    if (existing) {
-      await existing.show();
-      await existing.setFocus();
-      return;
-    }
-    const win = new WebviewWindow("minibar", {
-      url: "index.html?window=minibar",
-      title: "Recording",
-      width: 240,
-      height: 56,
-      decorations: false,
-      transparent: true,
-      alwaysOnTop: true,
-      skipTaskbar: true,
-      resizable: false,
-      focus: false,
-      x: 24,
-      y: 24,
-    });
-    win.once("tauri://error", (e) => console.error("minibar error", e));
+    setPane("windowPicker");
   };
 
   const registerHotkeys = async () => {
@@ -163,28 +174,33 @@ export default function App() {
       await unregister(SUBTITLE_HOTKEY).catch(() => {});
       await unregister(STOP_HOTKEY).catch(() => {});
       await register(SUBTITLE_HOTKEY, async (e) => {
-        if (e.state === "Pressed") await openSubtitleWindow();
+        if (e.state === "Pressed") {
+          const w = getCurrentWindow();
+          await w.show().catch(() => {});
+          await w.setFocus().catch(() => {});
+          setPane("subtitle");
+        }
       });
       await register(STOP_HOTKEY, async (e) => {
-        if (e.state === "Pressed") await stop();
+        if (e.state === "Pressed") await stopRef.current();
       });
     } catch (err) {
-      console.warn("hotkey register failed", err);
+      console.warn("hotkey register failed (non-fatal)", err);
     }
   };
 
   const start = async () => {
     if (!outputDir) {
-      showToast("请先选择保存位置");
+      showToast("请先在设置中选择保存位置");
+      setPane("settings");
       return;
     }
     if (captureMode === "window" && !selectedWindow) {
-      showToast("请先选择要录制的窗口");
+      showToast("请选择要录制的窗口");
       await openWindowPicker();
       return;
     }
 
-    // 1) Start ffmpeg recording — this is the only critical step.
     try {
       await invoke("start_recording", {
         opts: {
@@ -202,30 +218,25 @@ export default function App() {
       return;
     }
 
-    // 2) Immediately hide main window so it stops covering the captured area.
-    //    MUST happen before any optional step that could fail (registerHotkeys
-    //    often throws on company PCs with global-shortcut group policies).
-    if (autoHide) {
-      try {
-        await getCurrentWindow().hide();
-        console.log("main window hidden");
-      } catch (err) {
-        console.error("hide failed", err);
+    setPane("bar");
+    setPillExpanded(false);
+    try { await registerHotkeys(); } catch {}
+
+    // Snap pill to top-right corner of current monitor.
+    try {
+      const w = getCurrentWindow();
+      const pos = await w.outerPosition();
+      savedPosRef.current = { x: pos.x, y: pos.y };
+      const mon = await currentMonitor();
+      if (mon) {
+        const physW = mon.size.width;
+        const scale = mon.scaleFactor || 1;
+        // Place at physical right-edge minus pill width (in physical px).
+        const x = Math.max(0, physW - Math.round((PILL_W + 12) * scale));
+        const y = Math.round(12 * scale);
+        await w.setPosition(new PhysicalPosition(x, y));
       }
-    }
-
-    // 3) Everything after this is best-effort — hotkeys, mini-bar, status poll.
-    try {
-      await registerHotkeys();
-    } catch (err) {
-      console.warn("registerHotkeys failed", err);
-    }
-
-    try {
-      await openMiniBar();
-    } catch (err) {
-      console.warn("openMiniBar failed", err);
-    }
+    } catch (e) { console.warn("pill snap failed", e); }
 
     try {
       const s = await invoke<RecordingStatus>("get_status");
@@ -240,91 +251,220 @@ export default function App() {
       const finalPath = await invoke<string>("stop_recording");
       await unregister(SUBTITLE_HOTKEY).catch(() => {});
       await unregister(STOP_HOTKEY).catch(() => {});
-      const subWin = await WebviewWindow.getByLabel("subtitle");
-      if (subWin) await subWin.close();
-      const miniWin = await WebviewWindow.getByLabel("minibar");
-      if (miniWin) await miniWin.close();
-
-      // Restore main window (it was hidden via hide() during start).
-      try {
-        const w = getCurrentWindow();
-        await w.show();
-        await w.unminimize();
-        await w.setFocus();
-      } catch {}
-
       setStatus({ is_recording: false, output_path: finalPath, elapsed_ms: 0, subtitle_count: 0 });
-      showToast(`已保存 · ${shortenPath(finalPath, 40)}`);
+      setPane("bar");
+      setPillExpanded(false);
+      // Restore previous window position if we snapped to top-right.
+      if (savedPosRef.current) {
+        try {
+          await getCurrentWindow().setPosition(
+            new PhysicalPosition(savedPosRef.current.x, savedPosRef.current.y)
+          );
+        } catch {}
+        savedPosRef.current = null;
+      }
+      showToast(`已保存`);
     } catch (e: any) {
       showToast(`保存失败: ${e}`);
     }
   };
 
-  useEffect(() => {
-    stopRef.current = stop;
-  });
+  useEffect(() => { stopRef.current = stop; });
+
+  const submitSubtitle = async () => {
+    const text = subtitleText.trim();
+    if (!text) { setPane("bar"); return; }
+    try {
+      const count = await invoke<number>("add_subtitle", { text });
+      setStatus((s) => ({ ...s, subtitle_count: count }));
+      setSubtitleText("");
+      setPane("bar");
+      showToast(`已记录字幕 #${count}`);
+    } catch (e: any) {
+      showToast(`字幕失败: ${e}`);
+    }
+  };
+
+  const closeApp = async () => {
+    try { await getCurrentWindow().close(); } catch (e) { console.error("close failed", e); }
+  };
 
   const pickFolder = async () => {
     const selected = await openDialog({
-      directory: true,
-      multiple: false,
+      directory: true, multiple: false,
       defaultPath: outputDir || undefined,
     });
     if (typeof selected === "string") setOutputDir(selected);
+  };
+
+  const pickWindow = (title: string) => {
+    setSelectedWindow(title);
+    setCaptureMode("window");
+    setPane("settings");
   };
 
   const reveal = async () => {
     if (status.output_path) await invoke("reveal_in_explorer", { path: status.output_path });
   };
 
-  const pickWindow = (title: string) => {
-    setSelectedWindow(title);
-    setCaptureMode("window");
-    setShowWindowPicker(false);
-  };
-
   const timerText = useMemo(() => formatTime(status.elapsed_ms), [status.elapsed_ms]);
 
-  return (
-    <div className="app">
-      <header className="titlebar">
-        <div className="brand">
-          <div className="brand-dot" />
-          <div>
-            <div className="brand-title">ScreenRecord</div>
-            <div className="brand-subtitle">便携 · 极简 · 字幕速记</div>
-          </div>
-        </div>
-        {status.subtitle_count > 0 && (
-          <span className="chip">
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M4 4h16v16H4V4zm2 6v2h12v-2H6zm0 4v2h8v-2H6z" />
-            </svg>
-            {status.subtitle_count}
-          </span>
-        )}
-      </header>
-
-      <div className="stage">
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
-          <div className={`timer ${status.is_recording ? "recording" : ""}`}>{timerText}</div>
-          <div className="timer-label">{status.is_recording ? "REC" : "READY"}</div>
-        </div>
-        <button
-          className={`record-btn ${status.is_recording ? "recording" : ""}`}
-          onClick={status.is_recording ? stop : start}
-          aria-label={status.is_recording ? "Stop" : "Start"}
+  // ============ RENDER ============
+  if (pane === "bar") {
+    // Compact pill mode while recording (collapses to a small dot+timer in the
+    // top-right corner so it doesn't obstruct the screen). Hover to expand.
+    if (status.is_recording && !pillExpanded) {
+      return (
+        <div
+          className="float-pill"
+          onMouseEnter={() => setPillExpanded(true)}
+          onClick={() => setPillExpanded(true)}
+          title="悬停展开 · Ctrl+Alt+R 停止"
         >
-          <span className="record-btn-inner" />
+          <span className="fp-dot" />
+          <span className="fp-time">{timerText}</span>
+        </div>
+      );
+    }
+
+    return (
+      <div
+        className={`float-bar ${status.is_recording ? "recording" : ""}`}
+        onMouseLeave={() => { if (status.is_recording) setPillExpanded(false); }}
+      >
+        <button
+          className="fb-btn fb-btn-ghost"
+          onClick={() => setPane("settings")}
+          title="设置"
+          disabled={status.is_recording}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
+        </button>
+
+        <button
+          className={`fb-record ${status.is_recording ? "recording" : ""}`}
+          onClick={status.is_recording ? stop : start}
+          title={status.is_recording ? "停止 (Ctrl+Alt+R)" : "开始录制"}
+        >
+          <span className="fb-record-inner" />
+        </button>
+
+        <div className="fb-timer" data-tauri-drag-region title="拖动以移动">
+          <span className={`fb-timer-text ${status.is_recording ? "rec" : ""}`} data-tauri-drag-region>{timerText}</span>
+          <span className="fb-timer-label" data-tauri-drag-region>{captureMode === "window" ? "窗口" : "全屏"}</span>
+        </div>
+
+        <button
+          className="fb-btn fb-btn-ghost"
+          onClick={() => setPane("subtitle")}
+          title="插入字幕 (Ctrl+Alt+S)"
+          disabled={!status.is_recording}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M4 4h16v16H4V4zm2 6v2h12v-2H6zm0 4v2h8v-2H6z" />
+          </svg>
+          {status.subtitle_count > 0 && <span className="fb-badge">{status.subtitle_count}</span>}
+        </button>
+
+        <button
+          className="fb-btn fb-btn-close"
+          onClick={closeApp}
+          title="退出"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round">
+            <path d="M18 6L6 18M6 6l12 12" />
+          </svg>
+        </button>
+
+        {toast && <div className="fb-toast">{toast}</div>}
+      </div>
+    );
+  }
+
+  if (pane === "subtitle") {
+    return (
+      <div className="panel-window subtitle-pane">
+        <div className="panel-header" data-tauri-drag-region>
+          <span className="panel-title">插入字幕</span>
+          <span className="panel-time">{timerText}</span>
+        </div>
+        <input
+          ref={subtitleInputRef}
+          className="subtitle-input-large"
+          value={subtitleText}
+          onChange={(e) => setSubtitleText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") submitSubtitle();
+            else if (e.key === "Escape") { setSubtitleText(""); setPane("bar"); }
+          }}
+          placeholder="输入字幕内容，回车记录…"
+          autoFocus
+        />
+        <div className="panel-footer">
+          <button className="btn btn-ghost-light" onClick={() => { setSubtitleText(""); setPane("bar"); }}>取消 (Esc)</button>
+          <button className="btn btn-primary" onClick={submitSubtitle}>记录 (Enter)</button>
+        </div>
+        {toast && <div className="fb-toast">{toast}</div>}
+      </div>
+    );
+  }
+
+  if (pane === "windowPicker") {
+    return (
+      <div className="panel-window">
+        <div className="panel-header" data-tauri-drag-region>
+          <button className="icon-btn" onClick={() => setPane("settings")} title="返回">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M19 12H5M12 19l-7-7 7-7" />
+            </svg>
+          </button>
+          <span className="panel-title">选择窗口</span>
+          <button className="icon-btn" onClick={refreshWindows} title="刷新">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M17.65 6.35A7.95 7.95 0 0012 4a8 8 0 108 8h-2a6 6 0 11-1.76-4.24L13 11h7V4l-2.35 2.35z" />
+            </svg>
+          </button>
+        </div>
+        <div className="window-list">
+          {windows.length === 0 ? (
+            <div className="window-empty">未发现可录制窗口，点击右上角刷新</div>
+          ) : (
+            windows.map((w) => (
+              <button
+                key={w.title}
+                className={`window-item ${selectedWindow === w.title ? "active" : ""}`}
+                onClick={() => pickWindow(w.title)}
+                title={w.title}
+              >
+                <div className="window-item-title">{w.title}</div>
+                <div className="window-item-proc">{w.process_name}</div>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // pane === "settings"
+  return (
+    <div className="panel-window">
+      <div className="panel-header" data-tauri-drag-region>
+        <span className="panel-title">设置</span>
+        <button className="icon-btn" onClick={() => setPane("bar")} title="完成">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <path d="M18 6L6 18M6 6l12 12" />
+          </svg>
         </button>
       </div>
 
-      {/* Mode segmented control */}
       <div className="segmented">
         <button
           className={`seg-btn ${captureMode === "screen" ? "active" : ""}`}
-          onClick={() => !status.is_recording && setCaptureMode("screen")}
-          disabled={status.is_recording}
+          onClick={() => setCaptureMode("screen")}
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
             <path d="M3 4h18v12H3z" opacity=".25" /><path d="M3 4h18a1 1 0 011 1v11a1 1 0 01-1 1H3a1 1 0 01-1-1V5a1 1 0 011-1zm0 2v10h18V6H3zm5 14h8v2H8z" />
@@ -333,8 +473,7 @@ export default function App() {
         </button>
         <button
           className={`seg-btn ${captureMode === "window" ? "active" : ""}`}
-          onClick={() => !status.is_recording && (selectedWindow ? setCaptureMode("window") : openWindowPicker())}
-          disabled={status.is_recording}
+          onClick={() => selectedWindow ? setCaptureMode("window") : openWindowPicker()}
         >
           <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
             <path d="M4 5h16v3H4z" /><path d="M4 5h16v14H4z" opacity=".25" /><path d="M4 5h16a1 1 0 011 1v13a1 1 0 01-1 1H4a1 1 0 01-1-1V6a1 1 0 011-1zm0 2v12h16V7H4z" />
@@ -368,7 +507,6 @@ export default function App() {
             className="select"
             value={framerate}
             onChange={(e) => setFramerate(Number(e.target.value))}
-            disabled={status.is_recording}
           >
             <option value={24}>24 fps</option>
             <option value={30}>30 fps</option>
@@ -382,12 +520,7 @@ export default function App() {
             </span>
             录制音频
           </div>
-          <div
-            className={`switch ${includeAudio ? "on" : ""}`}
-            onClick={() => !status.is_recording && setIncludeAudio((v) => !v)}
-            role="switch"
-            aria-checked={includeAudio}
-          />
+          <div className={`switch ${includeAudio ? "on" : ""}`} onClick={() => setIncludeAudio((v) => !v)} role="switch" aria-checked={includeAudio} />
         </div>
         <div className="card-row">
           <div className="card-row-label">
@@ -396,26 +529,7 @@ export default function App() {
             </span>
             录制鼠标
           </div>
-          <div
-            className={`switch ${showCursor ? "on" : ""}`}
-            onClick={() => !status.is_recording && setShowCursor((v) => !v)}
-            role="switch"
-            aria-checked={showCursor}
-          />
-        </div>
-        <div className="card-row">
-          <div className="card-row-label">
-            <span className="icon-bubble green">
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M19 13H5v-2h14v2zm0-4H5V7h14v2z"/></svg>
-            </span>
-            开始时隐藏窗口
-          </div>
-          <div
-            className={`switch ${autoHide ? "on" : ""}`}
-            onClick={() => !status.is_recording && setAutoHide((v) => !v)}
-            role="switch"
-            aria-checked={autoHide}
-          />
+          <div className={`switch ${showCursor ? "on" : ""}`} onClick={() => setShowCursor((v) => !v)} role="switch" aria-checked={showCursor} />
         </div>
         <div className="card-row">
           <div className="card-row-label">
@@ -428,7 +542,7 @@ export default function App() {
             {outputDir ? shortenPath(outputDir, 32) : "选择文件夹"}
           </span>
         </div>
-        {status.output_path && !status.is_recording && (
+        {status.output_path && (
           <div className="card-row">
             <div className="card-row-label">
               <span className="icon-bubble green">
@@ -447,46 +561,7 @@ export default function App() {
         <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>S</kbd> 字幕 ·{" "}
         <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>R</kbd> 停止录制
       </div>
-
-      {/* Window picker modal */}
-      {showWindowPicker && (
-        <div className="modal-backdrop" onClick={() => setShowWindowPicker(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <span>选择窗口</span>
-              <button className="icon-btn" onClick={refreshWindows} title="刷新">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M17.65 6.35A7.95 7.95 0 0012 4a8 8 0 108 8h-2a6 6 0 11-1.76-4.24L13 11h7V4l-2.35 2.35z" />
-                </svg>
-              </button>
-            </div>
-            <div className="window-list">
-              {windows.length === 0 ? (
-                <div className="window-empty">未发现可录制窗口，点击右上角刷新</div>
-              ) : (
-                windows.map((w) => (
-                  <button
-                    key={w.title}
-                    className={`window-item ${selectedWindow === w.title ? "active" : ""}`}
-                    onClick={() => pickWindow(w.title)}
-                    title={w.title}
-                  >
-                    <div className="window-item-title">{w.title}</div>
-                    <div className="window-item-proc">{w.process_name}</div>
-                  </button>
-                ))
-              )}
-            </div>
-            <div className="modal-footer">
-              <button className="btn btn-ghost-light" onClick={() => setShowWindowPicker(false)}>
-                取消
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {toast && <div className="toast">{toast}</div>}
+      {toast && <div className="fb-toast">{toast}</div>}
     </div>
   );
 }
