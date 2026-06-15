@@ -16,8 +16,22 @@ interface WindowInfo {
   process_name: string;
 }
 
+interface RecordingInfo {
+  filename: string;
+  path: string;
+  size_bytes: number;
+  modified: string;
+}
+
+interface SubtitleInput {
+  start_ms: number;
+  end_ms: number;
+  text: string;
+}
+
 type CaptureMode = "screen" | "window";
-type Pane = "bar" | "settings" | "subtitle" | "windowPicker";
+type OutputFormat = "mp4" | "mkv" | "webm";
+type Pane = "bar" | "settings" | "subtitle" | "windowPicker" | "subtitleEditor";
 
 const SUBTITLE_HOTKEY = "CommandOrControl+Alt+S";
 const STOP_HOTKEY = "CommandOrControl+Alt+R";
@@ -31,6 +45,8 @@ const PANEL_W = 460;
 const PANEL_H = 600;
 const SUB_W = 560;
 const SUB_H = 200;
+const EDITOR_W = 560;
+const EDITOR_H = 700;
 
 function formatTime(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000));
@@ -39,6 +55,35 @@ function formatTime(ms: number): string {
   const s = total % 60;
   if (h > 0) return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
   return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+}
+
+function formatMs(ms: number): string {
+  const total = Math.max(0, ms);
+  const m = Math.floor(total / 60000);
+  const s = Math.floor((total % 60000) / 1000);
+  const mil = total % 1000;
+  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}.${mil.toString().padStart(3, "0")}`;
+}
+
+function parseMsInput(val: string): number {
+  if (!val.trim()) return 0;
+  const parts = val.split(":");
+  if (parts.length === 2) {
+    const m = parseInt(parts[0]) || 0;
+    const secParts = parts[1].split(".");
+    const s = parseInt(secParts[0]) || 0;
+    const ms = secParts.length > 1 ? parseInt(secParts[1].padEnd(3, "0").slice(0, 3)) || 0 : 0;
+    return m * 60000 + s * 1000 + ms;
+  }
+  if (parts.length === 3) {
+    const h = parseInt(parts[0]) || 0;
+    const m = parseInt(parts[1]) || 0;
+    const secParts = parts[2].split(".");
+    const s = parseInt(secParts[0]) || 0;
+    const ms = secParts.length > 1 ? parseInt(secParts[1].padEnd(3, "0").slice(0, 3)) || 0 : 0;
+    return h * 3600000 + m * 60000 + s * 1000 + ms;
+  }
+  return Math.round((parseFloat(val) || 0) * 1000);
 }
 
 function shortenPath(p: string, max = 36): string {
@@ -54,6 +99,8 @@ interface Persisted {
   showCursor: boolean;
   captureMode: CaptureMode;
   selectedWindow: string;
+  outputFormat: OutputFormat;
+  audioDevice: string;
 }
 
 function loadSettings(): Partial<Persisted> {
@@ -82,7 +129,17 @@ export default function App() {
   const [showCursor, setShowCursor] = useState(persisted.showCursor !== false);
   const [captureMode, setCaptureMode] = useState<CaptureMode>(persisted.captureMode ?? "screen");
   const [selectedWindow, setSelectedWindow] = useState<string>(persisted.selectedWindow ?? "");
+  const [outputFormat, setOutputFormat] = useState<OutputFormat>(persisted.outputFormat ?? "mp4");
+  const [audioDevice, setAudioDevice] = useState<string>(persisted.audioDevice ?? "");
+  const [audioDevices, setAudioDevices] = useState<string[]>([]);
   const [pane, setPane] = useState<Pane>("bar");
+  const [recordings, setRecordings] = useState<RecordingInfo[]>([]);
+  const [selectedRecording, setSelectedRecording] = useState<string | null>(null);
+  const [editorSubtitles, setEditorSubtitles] = useState<SubtitleInput[]>([]);
+  const [editorNewStart, setEditorNewStart] = useState("");
+  const [editorNewEnd, setEditorNewEnd] = useState("");
+  const [editorNewText, setEditorNewText] = useState("");
+  const [burning, setBurning] = useState(false);
   const [windows, setWindows] = useState<WindowInfo[]>([]);
   const [subtitleText, setSubtitleText] = useState("");
   const [toast, setToast] = useState<string | null>(null);
@@ -108,6 +165,8 @@ export default function App() {
         target = { width: PANEL_W, height: PANEL_H }; break;
       case "subtitle":
         target = { width: SUB_W, height: SUB_H }; break;
+      case "subtitleEditor":
+        target = { width: EDITOR_W, height: EDITOR_H }; break;
       default:
         if (status.is_recording && !pillExpanded) {
           target = { width: PILL_W, height: PILL_H };
@@ -127,8 +186,8 @@ export default function App() {
 
   // Persist on change.
   useEffect(() => {
-    saveSettings({ outputDir, framerate, includeAudio, showCursor, captureMode, selectedWindow });
-  }, [outputDir, framerate, includeAudio, showCursor, captureMode, selectedWindow]);
+    saveSettings({ outputDir, framerate, includeAudio, showCursor, captureMode, selectedWindow, outputFormat, audioDevice });
+  }, [outputDir, framerate, includeAudio, showCursor, captureMode, selectedWindow, outputFormat, audioDevice]);
 
   // Status polling.
   useEffect(() => {
@@ -151,6 +210,13 @@ export default function App() {
       setTimeout(() => subtitleInputRef.current?.focus(), 50);
     }
   }, [pane]);
+
+  // Fetch audio devices when settings pane opens with audio enabled.
+  useEffect(() => {
+    if (pane === "settings" && includeAudio) {
+      refreshAudioDevices();
+    }
+  }, [pane, includeAudio]);
 
   const refreshWindows = async () => {
     try {
@@ -207,10 +273,11 @@ export default function App() {
           output_dir: outputDir,
           framerate,
           include_audio: includeAudio,
-          audio_device: null,
+          audio_device: audioDevice || null,
           capture_mode: captureMode,
           window_title: captureMode === "window" ? selectedWindow : null,
           show_cursor: showCursor,
+          output_format: outputFormat,
         },
       });
     } catch (e: any) {
@@ -305,6 +372,73 @@ export default function App() {
 
   const reveal = async () => {
     if (status.output_path) await invoke("reveal_in_explorer", { path: status.output_path });
+  };
+
+  const refreshAudioDevices = async () => {
+    try {
+      const devices = await invoke<string[]>("list_audio_devices");
+      setAudioDevices(devices);
+    } catch (e) { console.error("Failed to list audio devices", e); }
+  };
+
+  const refreshRecordings = async () => {
+    if (!outputDir) return;
+    try {
+      const list = await invoke<RecordingInfo[]>("list_recordings", { outputDir });
+      setRecordings(list);
+    } catch (e) { console.error(e); }
+  };
+
+  const addEditorSubtitle = () => {
+    if (!editorNewText.trim()) return;
+    const startMs = parseMsInput(editorNewStart);
+    const endMs = parseMsInput(editorNewEnd) || startMs + 3000;
+    setEditorSubtitles((prev) =>
+      [...prev, { start_ms: startMs, end_ms: endMs, text: editorNewText.trim() }]
+        .sort((a, b) => a.start_ms - b.start_ms)
+    );
+    setEditorNewStart("");
+    setEditorNewEnd("");
+    setEditorNewText("");
+  };
+
+  const removeEditorSubtitle = (index: number) => {
+    setEditorSubtitles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const importSrtFile = async () => {
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "SRT", extensions: ["srt"] }],
+        defaultPath: outputDir || undefined,
+      });
+      if (typeof selected !== "string") return;
+      const subs = await invoke<SubtitleInput[]>("import_srt", { path: selected });
+      setEditorSubtitles((prev) =>
+        [...prev, ...subs].sort((a, b) => a.start_ms - b.start_ms)
+      );
+      showToast(`已导入 ${subs.length} 条字幕`);
+    } catch (e: any) {
+      showToast(`导入失败: ${e}`);
+    }
+  };
+
+  const burnSubtitles = async () => {
+    if (!selectedRecording || editorSubtitles.length === 0) return;
+    setBurning(true);
+    try {
+      const result = await invoke<string>("burn_subtitles_to_video", {
+        videoPath: selectedRecording,
+        subtitles: editorSubtitles,
+      });
+      showToast(`字幕已烧录: ${shortenPath(result, 32)}`);
+      refreshRecordings();
+    } catch (e: any) {
+      showToast(`烧录失败: ${e}`);
+    } finally {
+      setBurning(false);
+    }
   };
 
   const timerText = useMemo(() => formatTime(status.elapsed_ms), [status.elapsed_ms]);
@@ -449,7 +583,97 @@ export default function App() {
     );
   }
 
-  // pane === "settings"
+  if (pane === "subtitleEditor") {
+    return (
+      <div className="panel-window">
+        <div className="panel-header" data-tauri-drag-region>
+          <button className="icon-btn" onClick={() => setPane("settings")} title="返回">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M19 12H5M12 19l-7-7 7-7" />
+            </svg>
+          </button>
+          <span className="panel-title">字幕编辑器</span>
+          <button className="icon-btn" onClick={refreshRecordings} title="刷新">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M17.65 6.35A7.95 7.95 0 0012 4a8 8 0 108 8h-2a6 6 0 11-1.76-4.24L13 11h7V4l-2.35 2.35z" />
+            </svg>
+          </button>
+        </div>
+
+        <div className="se-file-list">
+          {recordings.length === 0 ? (
+            <div className="se-empty">没有录制文件</div>
+          ) : (
+            recordings.map((r) => (
+              <button
+                key={r.path}
+                className={`se-file-item ${selectedRecording === r.path ? "active" : ""}`}
+                onClick={() => { setSelectedRecording(r.path); setEditorSubtitles([]); }}
+              >
+                <div className="se-file-name">{r.filename}</div>
+                <div className="se-file-meta">{r.modified} · {(r.size_bytes / 1024 / 1024).toFixed(1)} MB</div>
+              </button>
+            ))
+          )}
+        </div>
+
+        {selectedRecording && (
+          <>
+            <div className="se-subs-list">
+              {editorSubtitles.length === 0 ? (
+                <div className="se-empty">尚未添加字幕</div>
+              ) : (
+                editorSubtitles.map((sub, i) => (
+                  <div key={i} className="se-sub-item">
+                    <span className="se-sub-time">{formatMs(sub.start_ms)} → {formatMs(sub.end_ms)}</span>
+                    <span className="se-sub-text">{sub.text}</span>
+                    <button className="se-sub-del" onClick={() => removeEditorSubtitle(i)}>×</button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="se-add-row">
+              <input
+                className="se-time-input"
+                placeholder="00:05"
+                value={editorNewStart}
+                onChange={(e) => setEditorNewStart(e.target.value)}
+              />
+              <span className="se-arrow">→</span>
+              <input
+                className="se-time-input"
+                placeholder="00:10"
+                value={editorNewEnd}
+                onChange={(e) => setEditorNewEnd(e.target.value)}
+              />
+              <input
+                className="se-text-input"
+                placeholder="字幕内容"
+                value={editorNewText}
+                onChange={(e) => setEditorNewText(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") addEditorSubtitle(); }}
+              />
+              <button className="se-add-btn" onClick={addEditorSubtitle}>+</button>
+            </div>
+
+            <div className="panel-footer">
+              <button className="btn btn-ghost-light" onClick={importSrtFile}>导入 SRT</button>
+              <button
+                className="btn btn-primary"
+                onClick={burnSubtitles}
+                disabled={editorSubtitles.length === 0 || burning}
+              >
+                {burning ? "烧录中…" : `烧录字幕 (${editorSubtitles.length})`}
+              </button>
+            </div>
+          </>
+        )}
+
+        {toast && <div className="fb-toast">{toast}</div>}
+      </div>
+    );
+  }
   return (
     <div className="panel-window">
       <div className="panel-header" data-tauri-drag-region>
@@ -515,6 +739,23 @@ export default function App() {
         </div>
         <div className="card-row">
           <div className="card-row-label">
+            <span className="icon-bubble blue">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h16v16H4V4zm2 2v12h12V6H6z"/></svg>
+            </span>
+            输出格式
+          </div>
+          <select
+            className="select"
+            value={outputFormat}
+            onChange={(e) => setOutputFormat(e.target.value as OutputFormat)}
+          >
+            <option value="mp4">MP4</option>
+            <option value="mkv">MKV</option>
+            <option value="webm">WebM</option>
+          </select>
+        </div>
+        <div className="card-row">
+          <div className="card-row-label">
             <span className="icon-bubble orange">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a3 3 0 00-3 3v6a3 3 0 006 0V5a3 3 0 00-3-3zm-7 9a7 7 0 0014 0h-2a5 5 0 01-10 0H5zm6 7h2v3h-2z"/></svg>
             </span>
@@ -522,6 +763,26 @@ export default function App() {
           </div>
           <div className={`switch ${includeAudio ? "on" : ""}`} onClick={() => setIncludeAudio((v) => !v)} role="switch" aria-checked={includeAudio} />
         </div>
+        {includeAudio && (
+          <div className="card-row">
+            <div className="card-row-label">
+              <span className="icon-bubble orange">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.91-3c-.49 0-.9.36-.98.85C16.52 14.2 14.47 16 12 16s-4.52-1.8-4.93-4.15c-.08-.49-.49-.85-.98-.85-.61 0-1.09.54-1 1.14.49 3 2.89 5.35 5.91 5.78V21h2v-3.08c3.02-.43 5.42-2.78 5.91-5.78.1-.6-.39-1.14-1-1.14z"/></svg>
+              </span>
+              音频设备
+            </div>
+            <select
+              className="select"
+              value={audioDevice}
+              onChange={(e) => setAudioDevice(e.target.value)}
+            >
+              <option value="">系统默认</option>
+              {audioDevices.map((d) => (
+                <option key={d} value={d}>{d}</option>
+              ))}
+            </select>
+          </div>
+        )}
         <div className="card-row">
           <div className="card-row-label">
             <span className="icon-bubble orange">
@@ -555,6 +816,17 @@ export default function App() {
             </span>
           </div>
         )}
+        <div className="card-row">
+          <div className="card-row-label">
+            <span className="icon-bubble purple">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M4 4h16v16H4V4zm2 6v2h12v-2H6zm0 4v2h8v-2H6z"/></svg>
+            </span>
+            字幕编辑器
+          </div>
+          <span className="path-pill" onClick={() => { refreshRecordings(); setPane("subtitleEditor"); }}>
+            打开编辑…
+          </span>
+        </div>
       </div>
 
       <div className="hint">

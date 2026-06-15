@@ -22,6 +22,10 @@ pub fn run() {
             recorder::default_output_dir,
             recorder::reveal_in_explorer,
             recorder::list_windows,
+            recorder::list_audio_devices,
+            recorder::list_recordings,
+            recorder::burn_subtitles_to_video,
+            recorder::import_srt,
         ])
         .setup(|app| {
             // Ensure binaries dir exists for dev mode hint.

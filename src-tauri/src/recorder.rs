@@ -21,11 +21,14 @@ struct RecorderState {
     output_path: Option<PathBuf>,
     started_at: Option<chrono::DateTime<Local>>,
     subtitles: Vec<SubtitleEntry>,
+    output_format: Option<OutputFormat>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubtitleEntry {
     pub start_ms: i64,
+    #[serde(default)]
+    pub end_ms: Option<i64>,
     pub text: String,
 }
 
@@ -41,9 +44,30 @@ pub struct RecordOptions {
     pub window_title: Option<String>, // exact title for CaptureMode::Window
     #[serde(default = "default_show_cursor")]
     pub show_cursor: bool,
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 fn default_show_cursor() -> bool { true }
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    #[default]
+    Mp4,
+    Mkv,
+    Webm,
+}
+
+impl OutputFormat {
+    fn extension(&self) -> &str {
+        match self {
+            OutputFormat::Mp4 => "mp4",
+            OutputFormat::Mkv => "mkv",
+            OutputFormat::Webm => "webm",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -171,7 +195,7 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
     let out_dir = PathBuf::from(&opts.output_dir);
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("Create dir failed: {e}"))?;
     let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let out_file = out_dir.join(format!("ScreenRecord_{timestamp}.mp4"));
+    let out_file = out_dir.join(format!("ScreenRecord_{timestamp}.{}", opts.output_format.extension()));
 
     let ffmpeg = ffmpeg_path(&app)?;
 
@@ -226,15 +250,27 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
         cmd.args(["-f", "dshow"]).args(["-i", &audio_arg]);
     }
 
-    cmd.args(["-c:v", "libx264"])
-        .args(["-preset", "superfast"])
-        .args(["-tune", "zerolatency"])
-        .args(["-pix_fmt", "yuv420p"])
-        .args(["-crf", "23"])
-        .args(["-threads", "2"]);
-
-    if opts.include_audio {
-        cmd.args(["-c:a", "aac"]).args(["-b:a", "128k"]);
+    match opts.output_format {
+        OutputFormat::Mp4 | OutputFormat::Mkv => {
+            cmd.args(["-c:v", "libx264"])
+                .args(["-preset", "superfast"])
+                .args(["-tune", "zerolatency"])
+                .args(["-pix_fmt", "yuv420p"])
+                .args(["-crf", "23"])
+                .args(["-threads", "2"]);
+            if opts.include_audio {
+                cmd.args(["-c:a", "aac"]).args(["-b:a", "128k"]);
+            }
+        }
+        OutputFormat::Webm => {
+            cmd.args(["-c:v", "libvpx-vp9"])
+                .args(["-crf", "30"])
+                .args(["-b:v", "0"])
+                .args(["-threads", "2"]);
+            if opts.include_audio {
+                cmd.args(["-c:a", "libopus"]).args(["-b:a", "128k"]);
+            }
+        }
     }
 
     cmd.arg(out_file.to_string_lossy().to_string());
@@ -252,19 +288,21 @@ pub fn start_recording(app: tauri::AppHandle, opts: RecordOptions) -> Result<Str
     state.output_path = Some(out_file.clone());
     state.started_at = Some(Local::now());
     state.subtitles.clear();
+    state.output_format = Some(opts.output_format.clone());
 
     Ok(out_file.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 pub fn stop_recording(app: tauri::AppHandle) -> Result<String, String> {
-    let (mut child, output_path, subtitles) = {
+    let (mut child, output_path, subtitles, output_format) = {
         let mut state = RECORDER.lock().map_err(|e| e.to_string())?;
         let child = state.child.take().ok_or("No recording in progress")?;
         let path = state.output_path.take().ok_or("Missing output path")?;
         let subs = std::mem::take(&mut state.subtitles);
+        let fmt = state.output_format.take().unwrap_or_default();
         state.started_at = None;
-        (child, path, subs)
+        (child, path, subs, fmt)
     };
 
     // Send 'q' to ffmpeg stdin for graceful exit so MP4 moov atom is written.
@@ -290,7 +328,7 @@ pub fn stop_recording(app: tauri::AppHandle) -> Result<String, String> {
 
     // If subtitles exist, burn them into a new file using ffmpeg.
     let final_path = if !subtitles.is_empty() {
-        burn_subtitles(&app, &output_path, &subtitles).unwrap_or(output_path)
+        burn_subtitles(&app, &output_path, &subtitles, &output_format).unwrap_or(output_path)
     } else {
         output_path
     };
@@ -311,14 +349,16 @@ fn burn_subtitles(
     app: &tauri::AppHandle,
     video: &PathBuf,
     subs: &[SubtitleEntry],
+    output_format: &OutputFormat,
 ) -> Result<PathBuf, String> {
     let srt_path = video.with_extension("srt");
     let mut srt_content = String::new();
     for (i, sub) in subs.iter().enumerate() {
-        let end_ms = subs
-            .get(i + 1)
-            .map(|n| n.start_ms.min(sub.start_ms + 5000))
-            .unwrap_or(sub.start_ms + 3000);
+        let end_ms = sub.end_ms.unwrap_or_else(|| {
+            subs.get(i + 1)
+                .map(|n| n.start_ms.min(sub.start_ms + 5000))
+                .unwrap_or(sub.start_ms + 3000)
+        });
         srt_content.push_str(&format!("{}\n", i + 1));
         srt_content.push_str(&format!(
             "{} --> {}\n",
@@ -331,12 +371,12 @@ fn burn_subtitles(
     std::fs::write(&srt_path, srt_content).map_err(|e| e.to_string())?;
 
     let burned = video.with_file_name(format!(
-        "{}_subtitled.mp4",
-        video.file_stem().and_then(|s| s.to_str()).unwrap_or("output")
+        "{}_subtitled.{}",
+        video.file_stem().and_then(|s| s.to_str()).unwrap_or("output"),
+        output_format.extension()
     ));
 
     let ffmpeg = ffmpeg_path(app)?;
-    // ffmpeg subtitles filter on Windows needs forward slashes + escaped colon.
     let srt_for_filter = srt_path
         .to_string_lossy()
         .replace('\\', "/")
@@ -349,9 +389,26 @@ fn burn_subtitles(
     let mut cmd = Command::new(ffmpeg);
     cmd.arg("-y")
         .args(["-i", &video.to_string_lossy()])
-        .args(["-vf", &filter])
-        .args(["-c:a", "copy"])
-        .arg(burned.to_string_lossy().to_string())
+        .args(["-vf", &filter]);
+
+    match output_format {
+        OutputFormat::Mp4 | OutputFormat::Mkv => {
+            cmd.args(["-c:v", "libx264"])
+                .args(["-preset", "superfast"])
+                .args(["-crf", "23"])
+                .args(["-pix_fmt", "yuv420p"])
+                .args(["-c:a", "copy"]);
+        }
+        OutputFormat::Webm => {
+            cmd.args(["-c:v", "libvpx-vp9"])
+                .args(["-crf", "30"])
+                .args(["-b:v", "0"])
+                .args(["-c:a", "libopus"])
+                .args(["-b:a", "128k"]);
+        }
+    }
+
+    cmd.arg(burned.to_string_lossy().to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
@@ -373,6 +430,7 @@ pub fn add_subtitle(text: String) -> Result<usize, String> {
     let elapsed = (Local::now() - started).num_milliseconds();
     state.subtitles.push(SubtitleEntry {
         start_ms: elapsed,
+        end_ms: None,
         text,
     });
     Ok(state.subtitles.len())
@@ -506,5 +564,186 @@ pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
 #[cfg(not(target_os = "windows"))]
 #[tauri::command]
 pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
+    Ok(Vec::new())
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecordingInfo {
+    pub filename: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified: String,
+}
+
+#[tauri::command]
+pub fn list_recordings(output_dir: String) -> Result<Vec<RecordingInfo>, String> {
+    let dir = PathBuf::from(&output_dir);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut recordings = Vec::new();
+    let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !matches!(ext.as_str(), "mp4" | "mkv" | "webm") { continue; }
+
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.ends_with("_subtitled") { continue; }
+
+        let metadata = entry.metadata().map_err(|e| e.to_string())?;
+        let modified = metadata.modified()
+            .map_err(|e| e.to_string())?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?;
+        let dt = chrono::DateTime::from_timestamp(modified.as_secs() as i64, 0)
+            .unwrap_or_default()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        recordings.push(RecordingInfo {
+            filename: path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string(),
+            path: path.to_string_lossy().to_string(),
+            size_bytes: metadata.len(),
+            modified: dt,
+        });
+    }
+
+    recordings.sort_by(|a, b| b.modified.cmp(&a.modified));
+    Ok(recordings)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubtitleInput {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
+#[tauri::command]
+pub fn burn_subtitles_to_video(
+    app: tauri::AppHandle,
+    video_path: String,
+    subtitles: Vec<SubtitleInput>,
+) -> Result<String, String> {
+    let video = PathBuf::from(&video_path);
+    if !video.exists() {
+        return Err("Video file not found".into());
+    }
+    if subtitles.is_empty() {
+        return Err("No subtitles provided".into());
+    }
+
+    let ext = video.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4")
+        .to_lowercase();
+    let output_format = match ext.as_str() {
+        "mkv" => OutputFormat::Mkv,
+        "webm" => OutputFormat::Webm,
+        _ => OutputFormat::Mp4,
+    };
+
+    let entries: Vec<SubtitleEntry> = subtitles.into_iter().map(|s| SubtitleEntry {
+        start_ms: s.start_ms,
+        end_ms: Some(s.end_ms),
+        text: s.text,
+    }).collect();
+
+    let result = burn_subtitles(&app, &video, &entries, &output_format)?;
+    Ok(result.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn import_srt(path: String) -> Result<Vec<SubtitleInput>, String> {
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    let blocks: Vec<&str> = content.split("\n\n").collect();
+
+    for block in blocks {
+        let lines: Vec<&str> = block.trim().lines().collect();
+        if lines.len() < 3 { continue; }
+
+        let ts_line = lines[1];
+        let parts: Vec<&str> = ts_line.split(" --> ").collect();
+        if parts.len() != 2 { continue; }
+
+        let start_ms = parse_srt_timestamp(parts[0].trim())?;
+        let end_ms = parse_srt_timestamp(parts[1].trim())?;
+        let text = lines[2..].join("\n");
+
+        entries.push(SubtitleInput { start_ms, end_ms, text });
+    }
+
+    Ok(entries)
+}
+
+fn parse_srt_timestamp(ts: &str) -> Result<i64, String> {
+    let parts: Vec<&str> = ts.split(':').collect();
+    if parts.len() != 3 { return Err("Invalid SRT timestamp".into()); }
+    let h: i64 = parts[0].parse().map_err(|_| "Invalid hour")?;
+    let m: i64 = parts[1].parse().map_err(|_| "Invalid minute")?;
+    let sec_parts: Vec<&str> = parts[2].split(',').collect();
+    if sec_parts.len() != 2 { return Err("Invalid SRT timestamp".into()); }
+    let s: i64 = sec_parts[0].parse().map_err(|_| "Invalid second")?;
+    let ms: i64 = sec_parts[1].parse().map_err(|_| "Invalid millisecond")?;
+    Ok(h * 3600000 + m * 60000 + s * 1000 + ms)
+}
+
+#[cfg(target_os = "windows")]
+#[tauri::command]
+pub fn list_audio_devices(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let ffmpeg = ffmpeg_path(&app)?;
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.args(["-list_devices", "true"])
+        .args(["-f", "dshow"])
+        .arg("-i")
+        .arg("dummy")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd.output().map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let mut devices = Vec::new();
+    let mut in_audio_section = false;
+
+    for line in stderr.lines() {
+        if line.contains("DirectShow audio devices") {
+            in_audio_section = true;
+            continue;
+        }
+        if line.contains("DirectShow video devices") || line.contains("Dummy device") {
+            in_audio_section = false;
+            continue;
+        }
+        if in_audio_section && line.contains("(audio)") && !line.contains("Alternative") {
+            if let Some(start) = line.find('"') {
+                if let Some(end) = line[start + 1..].find('"') {
+                    let name = &line[start + 1..start + 1 + end];
+                    devices.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    if !devices.iter().any(|d| d == "virtual-audio-capturer") {
+        devices.push("virtual-audio-capturer".to_string());
+    }
+
+    Ok(devices)
+}
+
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+pub fn list_audio_devices(_app: tauri::AppHandle) -> Result<Vec<String>, String> {
     Ok(Vec::new())
 }

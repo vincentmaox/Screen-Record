@@ -2,6 +2,38 @@
 
 所有版本变更记录。版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] — 2026-06-15
+
+### 新功能
+
+- **多输出格式**：录制输出支持 MP4 / MKV / WebM 三种容器格式。
+  - MP4 / MKV：libx264 + AAC（与 v0.3.0 相同的编码参数）
+  - WebM：libvpx-vp9 + libopus（web 友好，CRF 30 恒质量模式）
+  - 字幕烧录自动匹配录制格式，WebM 格式下音频从 AAC 重编码为 Opus
+  - 设置面板新增"输出格式"下拉框
+- **音频设备选择**：录制音频不再硬编码 `virtual-audio-capturer`。
+  - 新增 `list_audio_devices` 命令（解析 ffmpeg dshow 设备列表）
+  - 设置面板"录制音频"开关下方新增设备下拉框（仅开启音频时显示）
+  - 选中的设备名持久化到 localStorage，下次启动自动回显
+- **录后字幕编辑器**：解决"一边录一边写字幕很困难"的问题。
+  - 新增 `subtitleEditor` pane：选择录制文件 → 手动添加字幕条目（开始/结束时间+文本）→ 烧录
+  - 支持导入 SRT 文件（UTF-8）
+  - 新增 Tauri 命令：`list_recordings` / `burn_subtitles_to_video` / `import_srt`
+  - `SubtitleEntry` 增加 `end_ms: Option<i64>`，实时字幕 `add_subtitle` 仍设为 None（向后兼容）
+  - 设置面板底部增加"字幕编辑器"入口
+
+### 基础设施
+
+- 版本号 0.3.0 → 0.4.0（Cargo.toml / package.json / tauri.conf.json）
+- gh CLI v2.94.0 安装完成，账号 `vincentmaox` 已登录
+- v0.3.0 GitHub Release 已发布：https://github.com/vincentmaox/Screen-Record/releases/tag/v0.3.0
+
+### 文件变更
+- `src-tauri/src/recorder.rs`：新增 `OutputFormat` 枚举 / `RecordingInfo` / `SubtitleInput` struct；`start_recording` 格式感知编解码器；`burn_subtitles` 增加 `output_format` 参数；新增 4 个 Tauri 命令
+- `src-tauri/src/lib.rs`：注册 4 个新命令
+- `src/App.tsx`：新增 `subtitleEditor` pane；`OutputFormat` / `audioDevice` 持久化；格式/设备下拉框；编辑器完整 UI
+- `src/App.css`：字幕编辑器全套样式（`.se-*`）
+
 ## [0.3.0] — 2026-06-13
 
 ### 重大架构变更
